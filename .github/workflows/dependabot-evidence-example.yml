@@ -1,0 +1,86 @@
+name: dependabot-evidence-example
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  dependabot-evidence-example:
+    runs-on: ubuntu-latest
+    env: 
+      REPO_NAME: 'dependabot-docker-local'
+      IMAGE_NAME: 'dependabot-docker-image'
+      BUILD_NAME: 'dependabot-evidence-eg'
+      VERSION: ${{ github.run_number }}
+      REGISTRY_DOMAIN: ${{ vars.REGISTRY_DOMAIN }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
+        
+      - name: Log in to Artifactory Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ARTIFACTORY_URL }}
+          username: ${{ secrets.JF_USER }}
+          password: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image and Push to Artifactory
+        run: |
+          docker build -f ./examples/dependabot-alerts-example/Dockerfile . --tag $REGISTRY_DOMAIN/$REPO_NAME/$IMAGE_NAME:$VERSION
+          jf rt docker-push $REGISTRY_DOMAIN/$REPO_NAME/$IMAGE_NAME:$VERSION $REPO_NAME --build-name=$BUILD_NAME --build-number=$VERSION
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch Dependabot Vulnerability Snapshot
+        id: dependabot_snapshot
+        env: 
+          GH_TOKEN: ${{ secrets.TOKEN_GIT }}    # GitHub Token with 'security_events: read' permission is required
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          gh api \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "repos/${OWNER}/${REPO}/dependabot/alerts" \
+            --jq '[.[] |
+             {
+                packageName: .dependency.package.name,
+                ecosystem: .dependency.package.ecosystem,
+                vulnerableVersionRange: .security_vulnerability.vulnerable_version_range,
+                patchedVersion: .security_vulnerability.first_patched_version.identifier,          
+                severity: .security_vulnerability.severity,               
+                ghsaId: .security_advisory.ghsa_id,               
+                cveId: .security_advisory.cve_id,                
+                advisoryUrl: .html_url,                
+                detectedAt: .created_at
+              }
+            ]' > result.json
+
+            cat result.json
+
+      - name: Create Dependabot Evidence
+        run: |
+          jf evd create \
+            --package-name $IMAGE_NAME \
+            --package-version $VERSION \
+            --package-repo-name $REPO_NAME \
+            --key "${{ secrets.TEST_PRVT_KEY }}" \
+            --key-alias ${{ secrets.TEST_PUB_KEY_ALIAS }} \
+            --predicate ./result.json \
+            --predicate-type http://Github.com/Dependabot/static-analysis
